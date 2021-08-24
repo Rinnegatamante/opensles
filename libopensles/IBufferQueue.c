@@ -17,7 +17,7 @@
 /* BufferQueue implementation */
 
 #include "sles_allinclusive.h"
-
+#include <speex/speex_resampler.h>
 
 /** Determine the state of the audio player or audio recorder associated with a buffer queue.
  *  Note that PLAYSTATE and RECORDSTATE values are equivalent (where PLAYING == RECORDING).
@@ -43,16 +43,19 @@ static SLuint32 getAssociatedState(IBufferQueue *this)
 }
 
 #define NUM_BUFFERS 32
+#define RESAMPLER_QUALITY 4 // Higher = Better
 void *avail_buffers[NUM_BUFFERS] = {NULL};
 int avail_buffers_idx = 0;
-
+#ifndef DISABLE_SPEEXDSP
+int first_boot = 1;
+SpeexResamplerState *resampler;
+#endif
 SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint32 size)
 {
     SL_ENTER_INTERFACE
     //SL_LOGV("IBufferQueue_Enqueue(%p, %p, %lu)", self, pBuffer, size);
 
     // Note that Enqueue while a Clear is pending is equivalent to Enqueue followed by Clear
-    
     if (NULL == pBuffer || 0 == size) {
         result = SL_RESULT_PARAMETER_INVALID;
     } else {
@@ -65,6 +68,82 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
         if (newRear == this->mFront) {
             result = SL_RESULT_BUFFER_INSUFFICIENT;
         } else {
+#ifdef DISABLE_SPEEXDSP
+            // Convert to PCM16 Stereo
+            uint32_t src_size = size;
+            int16_t *resample_src;
+            if (this->bps == 8)
+                src_size *= 2;
+            if (this->channels == 1)
+                src_size *= 2;
+            if (src_size != size) {
+                resample_src = malloc(src_size);
+                if (this->bps != 8) { // PCM16 Mono
+                    uint16_t *src = (uint16_t *)pBuffer;
+                    uint16_t *dst = (uint16_t *)resample_src;
+                    for (int j = 0; j < size; j++) {
+                        dst[j*2] = src[j];
+                        dst[j*2+1] = src[j];
+                    }
+                } else {
+                    if (this->channels == 2) { // PCM8 Stereo
+                        uint8_t *src = (uint8_t *)pBuffer;
+                        int16_t *dst = (int16_t *)resample_src;
+                        for (int j = 0; j < size; j += 2) {
+                            dst[j] = (int16_t)(src[j] - 0x80) << 8;
+                            dst[j+1] = (int16_t)(src[j+1] - 0x80) << 8;
+                        }
+                    } else { // PCM8 Mono
+                        uint8_t *src = (uint8_t *)pBuffer;
+                        int16_t *dst = (int16_t *)resample_src;
+                        for (int j = 0; j < size; j++) {
+                            dst[j*2] = (int16_t)(src[j] - 0x80) << 8;
+                            dst[j*2+1] = (int16_t)(src[j] - 0x80) << 8;
+                        }
+                    }
+                }
+            } else {
+                resample_src = (int16_t *)pBuffer;
+            }
+            
+            // Resample
+            uint32_t dst_size;
+            void *resample_dst;
+            if (this->samplerate != 44100000) {
+				if (first_boot) {
+					int resampler_err;
+					resampler = speex_resampler_init(2, this->samplerate / 1000, 44100, RESAMPLER_QUALITY, &resampler_err);
+					speex_resampler_skip_zeros(resampler);
+					first_boot = 0;
+				} else {
+					speex_resampler_reset_mem(resampler);
+					speex_resampler_set_rate(resampler, this->samplerate / 1000, 44100);
+				}
+                uint8_t extra = ((44100000 % this->samplerate) != 0) ? 1 : 0;
+                dst_size = src_size * ((44100000 / this->samplerate) + extra);
+                resample_dst = malloc(dst_size);
+				src_size /= 4;
+				dst_size /= 4;
+                speex_resampler_process_interleaved_int(resampler, resample_src, &src_size, resample_dst, &dst_size);
+				dst_size *= 4;
+                if (resample_src != pBuffer) {
+                    free(resample_src);
+                }
+            } else {
+                dst_size = src_size;
+                resample_dst = resample_src;
+            }
+            
+            // Send Buffer
+            if (resample_dst != pBuffer) {
+                if (avail_buffers[avail_buffers_idx])
+                    free(avail_buffers[avail_buffers_idx]);
+                avail_buffers[avail_buffers_idx] = resample_dst;
+                avail_buffers_idx = (avail_buffers_idx + 1) % NUM_BUFFERS;
+            }
+            oldRear->mBuffer = resample_dst;
+            oldRear->mSize = dst_size;
+#else
             int num_cycles = 44100000 / this->samplerate;
             int multiplier = 1;
             if (this->channels == 1)
@@ -99,13 +178,14 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
                         }
                     }
                 } else {
+					sceClibMemset(avail_buffers[avail_buffers_idx], 0, size * num_cycles * multiplier);
                     if (this->channels == 2) { // PCM8 Stereo
                         uint8_t *src = (uint8_t *)pBuffer;
                         int16_t *dst = (int16_t *)avail_buffers[avail_buffers_idx];
                         for (int j = 0; j < size; j += 2) {
                             for (int i = 0; i < num_cycles * 2; i+=2) {
-                                dst[i] = (src[0] - 0x80) << 8;
-                                dst[i+1] = (src[1] - 0x80) << 8;
+                                dst[i] = (int16_t)(src[0] - 0x80) << 8;
+                                dst[i+1] = (int16_t)(src[1] - 0x80) << 8;
                             }
                             src += 2;
                             dst += num_cycles * 2;
@@ -115,8 +195,8 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
                         int16_t *dst = (int16_t *)avail_buffers[avail_buffers_idx];
                         for (int j = 0; j < size; j++) {
                             for (int i = 0; i < num_cycles * 2; i+=2) {
-                                dst[i] = (*src - 0x80) << 8;
-                                dst[i+1] = (*src - 0x80) << 8;
+                                dst[i] = (int16_t)(*src - 0x80) << 8;
+                                dst[i+1] = (int16_t)(*src - 0x80) << 8;
                             }
                             src++;
                             dst += num_cycles * 2;
@@ -128,6 +208,7 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
             }
             oldRear->mBuffer = pBuffer;
             oldRear->mSize = size * num_cycles * multiplier;
+#endif
             this->mRear = newRear;
             ++this->mState.count;
             result = SL_RESULT_SUCCESS;
