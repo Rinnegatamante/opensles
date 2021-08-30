@@ -16,6 +16,9 @@
 
 /** \file OutputMixExt.h OutputMixExt interface */
 
+#include <AL/al.h>
+#include <AL/alc.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -41,6 +44,8 @@ typedef struct {
     SLuint32 mAvail;        ///< Number of available bytes in the current buffer
     float mGains[STEREO_CHANNELS]; ///< Copied from CAudioPlayer::mGains
     SLuint32 mFramesMixed;  ///< Number of sample frames mixed from track; reset periodically
+	ALuint al_source;
+	ALuint al_buffer;
 } Track;
 
 #ifndef this

@@ -18,7 +18,8 @@
 
 #include "sles_allinclusive.h"
 #include <math.h>
-
+#include <AL/al.h>
+#include <AL/alc.h>
 
 // OutputMixExt is used by SDL, but is not specific to or dependent on SDL
 
@@ -41,6 +42,7 @@ typedef enum {
 
 
 /** \brief Check whether a track has any data for us to read */
+ALuint cur_source;
 
 static SLboolean track_check(Track *track)
 {
@@ -125,6 +127,13 @@ static SLboolean track_check(Track *track)
             break;
 
         case SL_PLAYSTATE_STOPPING: // application thread(s) called Play::SetPlayState(STOPPED)
+			if (cur_source > 0) {
+				ALint state;
+				alGetSourcei(cur_source, AL_SOURCE_STATE, &state);
+				if (state == AL_PLAYING) {
+					alSourceStop(cur_source);
+				}
+			}
             audioPlayer->mPlay.mPosition = (SLmillisecond) 0;
             audioPlayer->mPlay.mFramesSinceLastSeek = 0;
             audioPlayer->mPlay.mFramesSincePositionUpdate = 0;
@@ -166,13 +175,15 @@ broadcast:
 
 /** \brief This is the track mixer: fill the specified 16-bit stereo PCM buffer */
 
+ALuint al_buffers[MAX_TRACK] = {0};
+ALuint al_sources[MAX_TRACK] = {0};
+
 void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 size)
 {
     SL_ENTER_INTERFACE_VOID
 
     // Force to be a multiple of a frame, assumes stereo 16-bit PCM
     size &= ~3;
-    SLboolean mixBufferHasData = SL_BOOLEAN_FALSE;
     IOutputMixExt *this = (IOutputMixExt *) self;
     IObject *thisObject = this->mThis;
     // This lock should never block, except when the application destroys the output mix object
@@ -198,135 +209,109 @@ void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 si
         assert(MAX_TRACK > i);
         activeMask &= ~(1 << i);
         Track *track = &this->mTracks[i];
-
-        // track is allocated
-
+		
+		cur_source = al_sources[i];
         if (!track_check(track)) {
             continue;
         }
-
-        // track is playing
-        void *dstWriter = pBuffer;
-        unsigned desired = size;
-        SLboolean trackContributedToMix = SL_BOOLEAN_FALSE;
-        float gains[STEREO_CHANNELS];
-        Summary summaries[STEREO_CHANNELS];
-        unsigned channel;
-        for (channel = 0; channel < STEREO_CHANNELS; ++channel) {
-            float gain = track->mGains[channel];
-            gains[channel] = gain;
-            Summary summary;
-            if (gain <= 0.001) {
-                summary = GAIN_MUTE;
-            } else if (gain >= 0.999) {
-                summary = GAIN_UNITY;
-            } else {
-                summary = GAIN_OTHER;
-            }
-            summaries[channel] = summary;
-        }
-        while (desired > 0) {
-            unsigned actual = desired;
-            if (track->mAvail < actual) {
-                actual = track->mAvail;
-            }
-            // force actual to be a frame multiple
-            if (actual > 0) {
-                assert(NULL != track->mReader);
-                stereo *mixBuffer = (stereo *) dstWriter;
-                const stereo *source = (const stereo *) track->mReader;
-                unsigned j;
-                if (GAIN_MUTE != summaries[0] || GAIN_MUTE != summaries[1]) {
-                    if (mixBufferHasData) {
-                        // apply gain during add
-                        if (GAIN_UNITY != summaries[0] || GAIN_UNITY != summaries[1]) {
-                            for (j = 0; j < actual; j += sizeof(stereo), ++mixBuffer, ++source) {
-                                mixBuffer->left += (short) (source->left * track->mGains[0]);
-                                mixBuffer->right += (short) (source->right * track->mGains[1]);
-                            }
-                        // no gain adjustment needed, so do a simple add
-                        } else {
-                            for (j = 0; j < actual; j += sizeof(stereo), ++mixBuffer, ++source) {
-                                mixBuffer->left += source->left;
-                                mixBuffer->right += source->right;
-                            }
-                        }
-                    } else {
-                        // apply gain during copy
-                        if (GAIN_UNITY != summaries[0] || GAIN_UNITY != summaries[1]) {
-                            for (j = 0; j < actual; j += sizeof(stereo), ++mixBuffer, ++source) {
-                                mixBuffer->left = (short) (source->left * track->mGains[0]);
-                                mixBuffer->right = (short) (source->right * track->mGains[1]);
-                            }
-                        // no gain adjustment needed, so do a simple copy
-                        } else {
-                            memcpy(dstWriter, track->mReader, actual);
-                        }
-                    }
-                    trackContributedToMix = SL_BOOLEAN_TRUE;
-                }
-                dstWriter = (char *) dstWriter + actual;
-                desired -= actual;
-                track->mReader = (char *) track->mReader + actual;
-                track->mAvail -= actual;
-                if (track->mAvail == 0) {
-                    IBufferQueue *bufferQueue = &track->mAudioPlayer->mBufferQueue;
-                    interface_lock_exclusive(bufferQueue);
-                    const BufferHeader *oldFront, *newFront, *rear;
-                    oldFront = bufferQueue->mFront;
-                    rear = bufferQueue->mRear;
-                    // a buffer stays on queue while playing, so it better still be there
-                    assert(oldFront != rear);
-                    newFront = oldFront;
-                    if (++newFront == &bufferQueue->mArray[bufferQueue->mNumBuffers + 1]) {
-                        newFront = bufferQueue->mArray;
-                    }
-                    bufferQueue->mFront = (BufferHeader *) newFront;
-                    assert(0 < bufferQueue->mState.count);
-                    --bufferQueue->mState.count;
-                    if (newFront != rear) {
-                        // we don't acknowledge application requests between buffers
-                        // within the same mixer frame
-                        assert(0 < bufferQueue->mState.count);
-                        track->mReader = newFront->mBuffer;
-                        track->mAvail = newFront->mSize;
-                    }
-                    // else we would set play state to playable but not playing during next mixer
-                    // frame if the queue is still empty at that time
-                    ++bufferQueue->mState.playIndex;
-                    slBufferQueueCallback callback = bufferQueue->mCallback;
-                    void *context = bufferQueue->mContext;
-                    interface_unlock_exclusive(bufferQueue);
-                    // The callback function is called on each buffer completion
-                    if (NULL != callback) {
-                        (*callback)((SLBufferQueueItf) bufferQueue, context);
-                        // Maybe it enqueued another buffer, or maybe it didn't.
-                        // We will find out later during the next mixer frame.
-                    }
-                }
-                // no lock, but safe because noone else updates this field
-                track->mFramesMixed += actual >> 2;    // sizeof(short) * STEREO_CHANNELS
-                continue;
-            }
-            // we need more data: desired > 0 but actual == 0
-            if (track_check(track)) {
-                continue;
-            }
-            // underflow: clear out rest of partial buffer (NTH synthesize comfort noise)
-            if (!mixBufferHasData && trackContributedToMix) {
-                memset(dstWriter, 0, actual);
-            }
-            break;
-        }
-        if (trackContributedToMix) {
-            mixBufferHasData = SL_BOOLEAN_TRUE;
-        }
+		
+		if (track->mAvail == 0) {
+			continue;
+		}
+		
+		if (al_sources[i] > 0) {
+			ALint state;
+			alGetSourcei(al_sources[i], AL_SOURCE_STATE, &state);
+			if (state == AL_PLAYING) {
+				continue;
+			} else {
+				alSourcei(al_sources[i], AL_BUFFER, 0);
+				alDeleteBuffers(1, &al_buffers[i]);
+			}
+		} else {
+			alGenSources(1, &al_sources[i]);
+			printf("%X\n", al_sources[i]);
+		}
+		
+		ALuint al_buffer, al_source;
+		alGenBuffers(1, &al_buffer);
+		al_buffers[i] = al_buffer;
+		al_source = al_sources[i];
+		
+		alSourcef(al_source, AL_PITCH, 1);
+		alSourcef(al_source, AL_GAIN, track->mGains[0]);
+		alSource3f(al_source, AL_POSITION, 0, 0, 0);
+		alSource3f(al_source, AL_VELOCITY, 0, 0, 0);
+		alSourcei(al_source, AL_LOOPING, AL_FALSE);
+		alSourcei(al_source, AL_SOURCE_RELATIVE, AL_TRUE);
+		
+		IBufferQueue *bufferQueue = &track->mAudioPlayer->mBufferQueue;
+		
+		ALenum format;
+		int frame_size;
+		if (bufferQueue->bps == 8) {
+			if (bufferQueue->channels == 2) {
+				format = AL_FORMAT_STEREO8;
+				frame_size = 2;
+			} else {
+				format = AL_FORMAT_MONO8;
+				frame_size = 1;
+			}
+		} else {
+			if (bufferQueue->channels == 2) {
+				format = AL_FORMAT_STEREO16;
+				frame_size = 4;
+			} else {
+				format = AL_FORMAT_MONO16;
+				frame_size = 2;
+			}
+		}
+		
+		int track_size = track->mAvail > (size * frame_size) ? (size * frame_size) : track->mAvail;
+		alBufferData(al_buffer, format, track->mReader, track_size, bufferQueue->samplerate / 1000);
+		alSourcei(al_source, AL_BUFFER, al_buffer);
+		alSourcePlay(al_source);
+		
+		track->mFramesMixed += track_size / frame_size;
+		track->mReader = (char *)track->mReader + track_size;
+		track->mAvail -= track_size;
+		
+		if (track->mAvail == 0) {
+			interface_lock_exclusive(bufferQueue);
+			const BufferHeader *oldFront, *newFront, *rear;
+			oldFront = bufferQueue->mFront;
+			rear = bufferQueue->mRear;
+			// a buffer stays on queue while playing, so it better still be there
+			assert(oldFront != rear);
+			newFront = oldFront;
+			if (++newFront == &bufferQueue->mArray[bufferQueue->mNumBuffers + 1]) {
+				newFront = bufferQueue->mArray;
+			}
+			bufferQueue->mFront = (BufferHeader *) newFront;
+			assert(0 < bufferQueue->mState.count);
+			--bufferQueue->mState.count;
+			if (newFront != rear) {
+				// we don't acknowledge application requests between buffers
+				// within the same mixer frame
+				assert(0 < bufferQueue->mState.count);
+				track->mReader = newFront->mBuffer;
+				track->mAvail = newFront->mSize;
+			}
+			// else we would set play state to playable but not playing during next mixer
+			// frame if the queue is still empty at that time
+			++bufferQueue->mState.playIndex;
+			slBufferQueueCallback callback = bufferQueue->mCallback;
+			void *context = bufferQueue->mContext;
+			interface_unlock_exclusive(bufferQueue);
+			// The callback function is called on each buffer completion
+			if (NULL != callback) {
+				(*callback)((SLBufferQueueItf) bufferQueue, context);
+				// Maybe it enqueued another buffer, or maybe it didn't.
+				// We will find out later during the next mixer frame.
+			}
+		}
     }
     object_unlock_exclusive(thisObject);
-    // No active tracks, so output silence
-    if (!mixBufferHasData) {
-        memset(pBuffer, 0, size);
-    }
 
     SL_LEAVE_INTERFACE_VOID
 }

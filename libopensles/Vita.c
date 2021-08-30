@@ -18,38 +18,26 @@
 
 #include "sles_allinclusive.h"
 #include <vitasdk.h>
+#include <AL/al.h>
+#include <AL/alc.h>
 
-/** \brief Called by SDL to fill the next audio output buffer */
+/** \brief Called by OpenAL to fill the next audio output buffer */
 IEngine *slEngine;
+
+static ALCdevice *ALDevice;
+static ALvoid *ALContext;
 
 uint8_t audio_buffers[SndFile_NUMBUFS][SndFile_BUFSIZE];
 
 static int audioThread(unsigned int args, void* arg) {
-	int ch = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, SndFile_BUFSIZE / 4, &_opensles_user_freq != NULL ? _opensles_user_freq : 44100, SCE_AUDIO_OUT_MODE_STEREO);
-	sceAudioOutSetConfig(ch, -1, -1, (SceAudioOutMode)-1);
-	
-	int vol_stereo[] = {32767, 32767};
-	sceAudioOutSetVolume(ch, (SceAudioOutChannelFlag)(SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH), vol_stereo);
-	
-	int buf_idx = 0;
-	
 	for (;;) {
-		uint8_t *stream = audio_buffers[buf_idx];
-		memset(stream, 0, (size_t)SndFile_BUFSIZE);
-		buf_idx = (buf_idx + 1) % SndFile_NUMBUFS;
-		
-		// A peek lock would be risky if output mixes are dynamic, so we use SDL_PauseAudio to
-		// temporarily disable callbacks during any change to the current output mix, and use a
-		// shared lock here
 		interface_lock_shared(slEngine);
 		COutputMix *outputMix = slEngine->mOutputMix;
 		interface_unlock_shared(slEngine);
 		if (NULL != outputMix) {
 			SLOutputMixExtItf OutputMixExt = &outputMix->mOutputMixExt.mItf;
-			IOutputMixExt_FillBuffer(OutputMixExt, stream, (SLuint32)SndFile_BUFSIZE);
+			IOutputMixExt_FillBuffer(OutputMixExt, NULL, (SLuint32)SndFile_BUFSIZE*2);
 		}
-		
-		sceAudioOutOutput(ch, stream);
 	}
 	
 	return sceKernelExitDeleteThread(0);
@@ -60,6 +48,26 @@ static int audioThread(unsigned int args, void* arg) {
 void SDL_open(IEngine *thisEngine)
 {
 	slEngine = thisEngine;
+		
+	ALCint attrlist[6];
+	attrlist[0] = ALC_FREQUENCY;
+	attrlist[1] = 44100;
+	attrlist[2] = ALC_SYNC;
+	attrlist[3] = AL_FALSE;
+	attrlist[4] = 0;
+	
+	ALDevice = alcOpenDevice(NULL);
+	ALContext = alcCreateContext(ALDevice, attrlist);
+	alcMakeContextCurrent(ALContext);
+
+	ALfloat pos[] = { 0.0, 0.0, 0.0 };
+	ALfloat vel[] = { 0.0, 0.0, 0.0 };
+	ALfloat or[]  = { 0.0, 0.0, 1.0, 0.0, -1.0, 0.0 };
+	alListenerf(AL_GAIN, 1.0);
+	alListenerfv(AL_POSITION, pos);
+	alListenerfv(AL_VELOCITY, vel);
+	alListenerfv(AL_ORIENTATION, or);
+  
 	SceUID thd = sceKernelCreateThread("OpenSLES Playback", &audioThread, 0x10000100, 0x10000, 0, 0, NULL);
 	sceKernelStartThread(thd, 0, NULL);
 }
