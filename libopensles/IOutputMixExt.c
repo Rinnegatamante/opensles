@@ -230,7 +230,6 @@ void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 si
 			}
 		} else {
 			alGenSources(1, &al_sources[i]);
-			printf("%X\n", al_sources[i]);
 		}
 		
 		ALuint al_buffer, al_source;
