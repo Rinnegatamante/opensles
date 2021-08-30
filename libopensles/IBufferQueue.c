@@ -46,6 +46,56 @@ static SLuint32 getAssociatedState(IBufferQueue *this)
 void *avail_buffers[NUM_BUFFERS] = {NULL};
 int avail_buffers_idx = 0;
 
+int16_t lerp(int16_t a, int16_t b, float w) {
+    return a + w * (b - a);
+}
+
+void process_stereo16(int16_t *src, int16_t *dst, int ratio) {
+    dst[0] = src[0];
+    dst[1] = src[1];
+    dst[ratio*2] = src[2];
+    dst[ratio*2+1] = src[3];
+    for (int i = 1; i < ratio - 1; i++) {
+        dst[i*2] = lerp(src[0], src[2], (float)i / (float)ratio);
+        dst[i*2+1] = lerp(src[1], src[3], (float)i / (float)ratio);
+    }
+}
+
+void process_mono16(int16_t *src, int16_t *dst, int ratio) {
+    dst[0] = src[0];
+    dst[1] = src[0];
+    dst[ratio*2] = src[1];
+    dst[ratio*2+1] = src[1];
+    for (int i = 1; i < ratio - 1; i++) {
+        int16_t s = lerp(src[0], src[1], (float)i / (float)ratio);
+        dst[i*2] = s;
+        dst[i*2+1] = s;
+    }
+}
+
+void process_stereo8(uint8_t *src, int16_t *dst, int ratio) {
+    dst[0] = ((int16_t)src[0] - 0x80) << 8;
+    dst[1] = ((int16_t)src[1]- 0x80) << 8;
+    dst[ratio*2] = ((int16_t)src[2]- 0x80) << 8;
+    dst[ratio*2+1] = ((int16_t)src[3]- 0x80) << 8;
+    for (int i = 1; i < ratio - 1; i++) {
+        dst[i*2] = lerp(dst[0], dst[ratio*2], (float)i / (float)ratio);
+        dst[i*2+1] = lerp(dst[1], dst[ratio*2+1], (float)i / (float)ratio);
+    }
+}
+
+void process_mono8(uint8_t *src, int16_t *dst, int ratio) {
+    dst[0] = ((int16_t)src[0] - 0x80) << 8;
+    dst[1] = ((int16_t)src[0] - 0x80) << 8;
+    dst[ratio*2] = ((int16_t)src[1]- 0x80) << 8;
+    dst[ratio*2+1] = ((int16_t)src[1]- 0x80) << 8;
+    for (int i = 1; i < ratio - 1; i++) {
+        int16_t s = lerp(dst[0], dst[ratio*2], (float)i / (float)ratio);
+        dst[i*2] = s;
+        dst[i*2+1] = s;
+    }
+}
+
 SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint32 size)
 {
     SL_ENTER_INTERFACE
@@ -56,7 +106,7 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
     if (NULL == pBuffer || 0 == size) {
         result = SL_RESULT_PARAMETER_INVALID;
     } else {
-        IBufferQueue *this = (IBufferQueue *) self;
+        IBufferQueue *this = (IBufferQueue *)self;
         interface_lock_exclusive(this);
         BufferHeader *oldRear = this->mRear, *newRear;
         if ((newRear = oldRear + 1) == &this->mArray[this->mNumBuffers + 1]) {
@@ -65,7 +115,7 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
         if (newRear == this->mFront) {
             result = SL_RESULT_BUFFER_INSUFFICIENT;
         } else {
-            int num_cycles = (&_opensles_user_freq!=NULL?_opensles_user_freq:44100) * 1000 / this->samplerate;
+            int num_cycles = (&_opensles_user_freq != NULL ? _opensles_user_freq : 44100) * 1000 / this->samplerate;
             int multiplier = 1;
             if (this->channels == 1)
                 multiplier *= 2;
@@ -74,28 +124,23 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
             if (num_cycles != 1 || this->channels == 1 || this->bps == 8) {
                 if (avail_buffers[avail_buffers_idx])
                     free(avail_buffers[avail_buffers_idx]);
-                avail_buffers[avail_buffers_idx] = calloc(1, size * num_cycles * multiplier);
+                avail_buffers[avail_buffers_idx] = malloc(size * num_cycles * multiplier);
                 if (this->bps != 8) {
                     if (this->channels == 2) { // PCM16 Stereo
-                        uint32_t *src = (uint32_t *)pBuffer;
-                        uint32_t *dst = (uint32_t *)avail_buffers[avail_buffers_idx];
-                        for (int j = 0; j < size; j += 4) {
-                            for (int i = 0; i < num_cycles; i++) {
-                                dst[i] = *src;
-                            }
-                            src++;
-                            dst += num_cycles;
+                        int16_t *src = (int16_t *)pBuffer;
+                        int16_t *dst = (int16_t *)avail_buffers[avail_buffers_idx];
+                        for (int j = 0; j < size; j += 2) {
+                            process_stereo16(src, dst, num_cycles);
+                            src += 2;
+                            dst += 2 + 2 * (num_cycles - 1);
                         }
                     } else { // PCM16 Mono
-                        uint16_t *src = (uint16_t *)pBuffer;
-                        uint16_t *dst = (uint16_t *)avail_buffers[avail_buffers_idx];
-                        for (int j = 0; j < size; j += 2) {
-                            for (int i = 0; i < num_cycles; i++) {
-                                dst[i*2] = *src;
-                                dst[i*2+1] = *src;
-                            }
+                        int16_t *src = (int16_t *)pBuffer;
+                        int16_t *dst = (int16_t *)avail_buffers[avail_buffers_idx];
+                        for (int j = 0; j < size; j++) {
+                            process_mono16(src, dst, num_cycles);
                             src++;
-                            dst += num_cycles * 2;
+                            dst += 2 + 2 * (num_cycles - 1);
                         }
                     }
                 } else {
@@ -103,23 +148,17 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
                         uint8_t *src = (uint8_t *)pBuffer;
                         int16_t *dst = (int16_t *)avail_buffers[avail_buffers_idx];
                         for (int j = 0; j < size; j += 2) {
-                            for (int i = 0; i < num_cycles; i++) {
-                                dst[i*2] = ((int16_t)src[0] - 0x80) << 8;
-                                dst[i*2+1] = ((int16_t)src[1] - 0x80) << 8;
-                            }
+                            process_stereo8(src, dst, num_cycles);
                             src += 2;
-                            dst += num_cycles * 2;
+                            dst += 2 + 2 * (num_cycles - 1);
                         }
                     } else { // PCM8 Mono
                         uint8_t *src = (uint8_t *)pBuffer;
                         int16_t *dst = (int16_t *)avail_buffers[avail_buffers_idx];
                         for (int j = 0; j < size; j++) {
-                            for (int i = 0; i < num_cycles; i++) {
-                                dst[i*2] = ((int16_t)*src - 0x80) << 8;
-                                dst[i*2+1] = ((int16_t)*src - 0x80) << 8;
-                            }
+                            process_mono8(src, dst, num_cycles);
                             src++;
-                            dst += num_cycles * 2;
+                            dst += 2 + 2 * (num_cycles - 1);
                         }
                     }
                 }
