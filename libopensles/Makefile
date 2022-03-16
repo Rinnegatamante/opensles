@@ -45,6 +45,10 @@ AR      = arm-vita-eabi-ar
 CFLAGS  = -Wl,-q -Wall -O3 $(INCLUDES) -DUSE_OUTPUTMIXEXT -DUSE_SDL -DUSE_SNDFILE
 CXXFLAGS  = $(CFLAGS)
 
+ifeq ($(CRAZY_TAXI),1)
+CFLAGS += -DCRAZY_TAXI
+endif
+
 ASFLAGS = $(CFLAGS)
 
 all: $(TARGET_LIB)

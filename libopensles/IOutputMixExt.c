@@ -238,6 +238,10 @@ void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 si
 		al_source = al_sources[i];
 		
 		alSourcef(al_source, AL_PITCH, 1);
+#ifdef CRAZY_TAXI // For some reasons, Crazy Taxy Classic sets music always way louder than all other sfx...
+		if (track->mGains[0] == 1.0f)
+			track->mGains[0] = 0.5f;
+#endif
 		alSourcef(al_source, AL_GAIN, track->mGains[0]);
 		alSource3f(al_source, AL_POSITION, 0, 0, 0);
 		alSource3f(al_source, AL_VELOCITY, 0, 0, 0);
