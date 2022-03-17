@@ -70,6 +70,13 @@ static SLboolean track_check(Track *track)
         const BufferHeader *oldFront;
 
         if (audioPlayer->mBufferQueue.mClearRequested) {
+			if (cur_source > 0) {
+				ALint state;
+				alGetSourcei(cur_source, AL_SOURCE_STATE, &state);
+				if (state == AL_PLAYING) {
+					alSourceStop(cur_source);
+				}
+			}
             // application thread(s) that call BufferQueue::Clear while mixer is active
             // will block synchronously until mixer acknowledges the Clear request
             audioPlayer->mBufferQueue.mFront = &audioPlayer->mBufferQueue.mArray[0];
@@ -83,6 +90,13 @@ static SLboolean track_check(Track *track)
         }
 
         if (audioPlayer->mDestroyRequested) {
+			if (cur_source > 0) {
+				ALint state;
+				alGetSourcei(cur_source, AL_SOURCE_STATE, &state);
+				if (state == AL_PLAYING) {
+					alSourceStop(cur_source);
+				}
+			}
             // an application thread that calls Object::Destroy while mixer is active will block
             // synchronously in the PreDestroy hook until mixer acknowledges the Destroy request
             COutputMix *outputMix = CAudioPlayer_GetOutputMix(audioPlayer);
