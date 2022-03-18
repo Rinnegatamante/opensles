@@ -252,9 +252,30 @@ void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 si
 		al_source = al_sources[i];
 		
 		alSourcef(al_source, AL_PITCH, 1);
-#ifdef CRAZY_TAXI // For some reasons, Crazy Taxy Classic sets music always way louder than all other sfx...
-		if (track->mGains[0] == 1.0f)
-			track->mGains[0] = 0.5f;
+#ifdef CRAZY_TAXI // Crazy Taxi Classic has an atrocious mixing, let's fix it...	
+		// 0.144046 intro
+		// 1.000000 music
+		// 0.336512 click menu & kakling when you start
+		// 0.189234 click menu 2
+		// 0.424620 crazy money and similars
+		// 1.000000 scream the rider
+		// 0.055783 music paused
+		// 0.197469 steering
+		// 0.146386 idle car engine
+		// 0.246888 another steering (?)
+		// 0.424620 run out of time etc
+		// 0.322478 some people
+		// 0.336512 some other people
+		
+		if (track->mGains[0] == track->mGains[1]) {
+			//if (track->mGains[0] > 0.1f)
+			//	printf("vol is: %f for length: %X\n", track->mGains[0], track->mAvail);
+			if (track->mGains[0] == 1.0f) // Music
+				if (track->mAvail < 0x10000)
+					track->mGains[0] -= 0.01f;
+				else
+					track->mGains[0] = 0.4f;
+		}
 #endif
 		alSourcef(al_source, AL_GAIN, track->mGains[0]);
 		alSource3f(al_source, AL_POSITION, 0, 0, 0);
